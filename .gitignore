@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.playwright-cli
+output/playwright
+.vercel
+premium-audit.json
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+*.local

@@ -1,0 +1,20 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["src"],
+  "locale": "es-CL",
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Table Selection", "Select/Listbox", "Date", "Form", "Scrollbar", "Toast", "CRUD"],
+  "ownership": {
+    "Select/Listbox": "native",
+    "Date": "typed"
+  },
+  "requiredCommands": ["unit", "lint", "build"],
+  "commands": {
+    "unit": "npm test",
+    "lint": "npm run lint",
+    "build": "npm run build"
+  },
+  "evidence": {
+    "failurePaths": "src/app/useMonitor.test.tsx"
+  }
+}

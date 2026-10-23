@@ -1,0 +1,12 @@
+{
+  "id": "/",
+  "name": "KontrolPR · Pull Request Monitor",
+  "short_name": "KontrolPR",
+  "lang": "es",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101a27",
+  "theme_color": "#101a27",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

@@ -1,0 +1,473 @@
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createQaTeamClient, QaTeamError } from "../lib/team/api-client";
+vi.mock("../lib/team/api-client", async () => ({ ...await vi.importActual<typeof import("../lib/team/api-client")>("../lib/team/api-client"), createQaTeamClient: vi.fn() }));
+import { useMonitor } from "./useMonitor";
+import { readRepository, getCurrentUser } from "../lib/bitbucket/reader";
+import { demoDataset } from "../features/pull-requests/services/fixtures";
+import { defaultPreferences, savePreferences } from "../lib/storage/indexed-db";
+import { notificationEventIds, playNotificationSound, showSystemNotification } from "../features/notifications/service";
+import { clearSession, sessionExpiresAt, readSession, saveSession, sessionStorageKey } from "../features/auth/services/session-storage";
+import { BitbucketApiError } from "../lib/bitbucket/contracts";
+import { clearSnapshotCache, syncIntervalMs } from "../lib/storage/snapshot-cache";
+import { readTeamDirectory } from "../lib/bitbucket/directory";
+import { qaSignature } from "../lib/review-revision";
+import { repositoryKey } from "../features/settings/services/tracking";
+
+vi.mock("../lib/bitbucket/reader", () => ({ getCurrentUser: vi.fn(), readRepository: vi.fn() }));
+vi.mock("../lib/bitbucket/directory", () => ({ readTeamDirectory: vi.fn().mockResolvedValue([]) }));
+vi.mock("../features/notifications/service", async () => ({ ...await vi.importActual<typeof import("../features/notifications/service")>("../features/notifications/service"), playNotificationSound: vi.fn(), showSystemNotification: vi.fn().mockResolvedValue(undefined) }));
+
+beforeEach(async () => {
+  vi.mocked(createQaTeamClient).mockReturnValue({ read: vi.fn().mockResolvedValue({ members: [{ accountId: "qa-javier", displayName: "Javier Mejías" }, { accountId: "qa-ivan", displayName: "Iván Reyes" }], revision: "initial", updatedAt: null, canEdit: true }), save: vi.fn(async (members) => ({ members, revision: "new", updatedAt: new Date().toISOString(), canEdit: true })) });
+  vi.clearAllMocks();
+  vi.mocked(showSystemNotification).mockResolvedValue(undefined);
+  clearSession();
+  await clearSnapshotCache();
+  await savePreferences(defaultPreferences);
+  await savePreferences(defaultPreferences, "test-live");
+  vi.mocked(getCurrentUser).mockResolvedValue({ accountId: "test-live", displayName: "Test user" });
+  vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug));
+});
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); clearSession(); });
+
+describe("monitor synchronization", () => {
+  it("restores incremental cursors with the cache and keeps failed repository watermarks unchanged", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    let failedRepository = "";
+    vi.mocked(readRepository).mockImplementation(async (_client, repo, _previous, _progress, ids, options) => {
+      if (repositoryKey(repo) === failedRepository) throw new Error("offline");
+      const snapshots = demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${repositoryKey(repo)}#${pr.id}` }));
+      options?.onComplete?.({ version: 1, repository: repositoryKey(repo), cursor: Date.now(), fullSyncedAt: options.checkpoint?.fullSyncedAt ?? Date.now(), qaSignature: qaSignature(ids ?? []), pullRequestIds: snapshots.map((pr) => pr.id) }, { mode: options.checkpoint ? "incremental" : "full", requests: 1, listed: 0, refreshed: 0, reused: snapshots.length, removed: 0 });
+      return snapshots;
+    });
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    expect(vi.mocked(readRepository).mock.calls.slice(0, 2).every((call) => call[5]?.checkpoint === undefined)).toBe(true);
+    const firstCursor = Date.now(); first.unmount();
+    clock.mockReturnValue(firstCursor + 1000);
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.syncState.source).toBe("cache");
+    expect(readRepository).toHaveBeenCalledTimes(2);
+    failedRepository = repositoryKey(defaultPreferences.repositories[0]);
+    await act(async () => { await restored.result.current.sync(); });
+    expect(vi.mocked(readRepository).mock.calls.slice(2, 4).every((call) => call[5]?.checkpoint?.cursor === firstCursor)).toBe(true);
+    expect(restored.result.current.syncState.status).toBe("error");
+    failedRepository = ""; clock.mockReturnValue(firstCursor + 2000);
+    await act(async () => { await restored.result.current.sync(); });
+    const retries = vi.mocked(readRepository).mock.calls.slice(4, 6);
+    expect(retries.find((call) => repositoryKey(call[1]) === repositoryKey(defaultPreferences.repositories[0]))?.[5]?.checkpoint?.cursor).toBe(firstCursor);
+    expect(retries.find((call) => repositoryKey(call[1]) === repositoryKey(defaultPreferences.repositories[1]))?.[5]?.checkpoint?.cursor).toBe(firstCursor + 1000);
+    expect(Object.values(restored.result.current.syncState.statistics ?? {}).every((metrics) => metrics.mode === "incremental")).toBe(true);
+  });
+  it("drops denied repository checkpoints and starts a fresh inventory after logout", async () => {
+    let deny = false;
+    vi.mocked(readRepository).mockImplementation(async (_client, repo, _previous, _progress, ids, options) => {
+      if (deny) throw new BitbucketApiError(403, "Denied", "forbidden");
+      const snapshots = demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${repositoryKey(repo)}#${pr.id}` }));
+      options?.onComplete?.({ version: 1, repository: repositoryKey(repo), cursor: Date.now(), fullSyncedAt: Date.now(), qaSignature: qaSignature(ids ?? []), pullRequestIds: snapshots.map((pr) => pr.id) }, { mode: "full", requests: 1, listed: snapshots.length, refreshed: snapshots.length, reused: 0, removed: 0 });
+      return snapshots;
+    });
+    const monitor = renderHook(useMonitor);
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    await act(async () => { await monitor.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    deny = true;
+    await act(async () => { await monitor.result.current.sync(); });
+    expect(monitor.result.current.data).toEqual([]);
+    deny = false;
+    await act(async () => { await monitor.result.current.sync(); });
+    expect(vi.mocked(readRepository).mock.calls.slice(4, 6).every((call) => call[5]?.checkpoint === undefined)).toBe(true);
+    act(() => monitor.result.current.disconnect());
+    await act(async () => { await monitor.result.current.connect("test@example.com", "test-token", "observer"); });
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    expect(vi.mocked(readRepository).mock.calls.slice(-2).every((call) => call[5]?.checkpoint === undefined)).toBe(true);
+  });
+  it("never substitutes legacy personal QA or fetches PR when the first shared read fails", async () => {
+    await savePreferences({ ...defaultPreferences, qaTeamMembers: [{ accountId: "personal-only", displayName: "Personal QA" }] }, "test-live");
+    const client = { read: vi.fn().mockRejectedValue(new QaTeamError("not_configured", "Configura el almacenamiento")), save: vi.fn() };
+    vi.mocked(createQaTeamClient).mockReturnValue(client);
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    expect(result.current.preferences.qaTeamMembers).toEqual([]);
+    expect(result.current.qaTeamState.errorCode).toBe("not_configured");
+    expect(result.current.data).toEqual([]); expect(readRepository).not.toHaveBeenCalled();
+    client.read.mockResolvedValue({ members: [], revision: "initial", canEdit: false, updatedAt: null });
+    await act(async () => { await result.current.refreshQaTeam(); });
+    await waitFor(() => expect(readRepository).toHaveBeenCalledTimes(2));
+    expect(result.current.preferences.qaTeamMembers).toEqual([]);
+    expect(vi.mocked(readRepository).mock.calls[0][4]).toEqual([]);
+  });
+  it("keeps the last verified team and PR on a later roster failure, without issuing misclassified reads", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "observer"); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const previous = result.current.data; const calls = vi.mocked(readRepository).mock.calls.length;
+    const client = vi.mocked(createQaTeamClient).mock.results[0].value;
+    vi.mocked(client.read).mockRejectedValue(new QaTeamError("unavailable", "Sin conexión"));
+    await act(async () => { await result.current.sync(); });
+    expect(result.current.data).toEqual(previous);
+    expect(result.current.preferences.qaTeamMembers).toHaveLength(2);
+    expect(result.current.qaTeamState.status).toBe("error");
+    expect(readRepository).toHaveBeenCalledTimes(calls);
+  });
+  it("revalidates shared membership before a fresh cached session can classify PR", async () => {
+    const client = { read: vi.fn().mockResolvedValue({ members: [{ accountId: "shared-one", displayName: "One" }], revision: "one", canEdit: false, updatedAt: null }), save: vi.fn() };
+    vi.mocked(createQaTeamClient).mockReturnValue(client);
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "developer"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false)); first.unmount();
+    client.read.mockResolvedValue({ members: [], revision: "two", canEdit: false, updatedAt: null });
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(client.read).toHaveBeenCalledTimes(2);
+    expect(restored.result.current.preferences.qaTeamMembers).toEqual([]);
+    await act(async () => { expect(await restored.result.current.saveQaTeam([])).toBe(false); });
+    expect(client.save).not.toHaveBeenCalled();
+  });
+  it("reads the directory on demand only for an active account, without reloading PR", async () => {
+    const monitor = renderHook(useMonitor);
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    await monitor.result.current.loadDirectory(new AbortController().signal);
+    expect(readTeamDirectory).not.toHaveBeenCalled();
+    await act(async () => { await monitor.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    const calls = vi.mocked(readRepository).mock.calls.length;
+    await act(async () => { await monitor.result.current.loadDirectory(new AbortController().signal); });
+    expect(readTeamDirectory).toHaveBeenCalledTimes(1);
+    expect(readRepository).toHaveBeenCalledTimes(calls);
+    act(() => monitor.result.current.disconnect());
+    await monitor.result.current.loadDirectory(new AbortController().signal);
+    expect(readTeamDirectory).toHaveBeenCalledTimes(1);
+  });
+  it("does not advertise a query scheduled after the fixed session expiry", async () => {
+    const createdAt = Date.now() - 12 * 60 * 60000 + 5 * 60000;
+    saveSession({ version: 2, email: "test@example.com", token: "test-token", createdAt, expiresAt: sessionExpiresAt(createdAt) });
+    const monitor = renderHook(useMonitor);
+    await waitFor(() => expect(monitor.result.current.syncState.status).toBe("success"));
+    expect(monitor.result.current.connected).toBe(true);
+    expect(monitor.result.current.syncState.nextSyncAt).toBeUndefined();
+  });
+  it("publishes the scheduler deadline, preserves it through F5 and resets it only after a completed sync", async () => {
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${pr.repository.workspace}/${pr.repository.slug}#${pr.id}` })));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.syncState.status).toBe("success"));
+    const original = first.result.current.syncState.nextSyncAt;
+    expect(Date.parse(original!)).toBe(Date.parse(first.result.current.syncState.lastSyncedAt!) + syncIntervalMs);
+    first.unmount(); clock.mockReturnValue(Date.now() + 5 * 60000);
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.syncState.nextSyncAt).toBe(original);
+    await act(async () => { await restored.result.current.sync(); });
+    expect(Date.parse(restored.result.current.syncState.nextSyncAt!)).toBe(Date.parse(original!) + 5 * 60000);
+    vi.mocked(readRepository).mockRejectedValue(new Error("offline"));
+    await act(async () => { await restored.result.current.sync(); });
+    expect(restored.result.current.syncState.status).toBe("error");
+    expect(restored.result.current.syncState.nextSyncAt).toBeDefined();
+  });
+  it("pauses automatic synchronization with no repositories and resumes when one is added", async () => {
+    await savePreferences({ ...defaultPreferences, repositories: [] }, "test-live");
+    const monitor = renderHook(useMonitor);
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    await act(async () => { await monitor.result.current.connect("test@example.com", "test-token", "qa"); });
+    expect(monitor.result.current.loading).toBe(false);
+    expect(monitor.result.current.syncState).toEqual({ status: "idle" });
+    expect(readRepository).not.toHaveBeenCalled();
+    await act(async () => { await monitor.result.current.sync(); });
+    expect(readRepository).not.toHaveBeenCalled();
+    act(() => monitor.result.current.changePreferences({ repositories: [defaultPreferences.repositories[0]] }));
+    await waitFor(() => expect(readRepository).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(monitor.result.current.syncState.nextSyncAt).toBeDefined());
+    act(() => monitor.result.current.changePreferences({ repositories: [] }));
+    await waitFor(() => expect(monitor.result.current.syncState).toEqual({ status: "idle" }));
+    expect(monitor.result.current.data).toEqual([]);
+  });
+  it("ignores personal QA overrides and re-reads evidence only for confirmed shared membership changes", async () => {
+    const monitor = renderHook(useMonitor);
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    await act(async () => { await monitor.result.current.connect("test@example.com", "test-token", "developer"); });
+    await waitFor(() => expect(monitor.result.current.loading).toBe(false));
+    const initialCalls = vi.mocked(readRepository).mock.calls.length;
+    act(() => monitor.result.current.changePreferences({ role: "qa" }));
+    expect(readRepository).toHaveBeenCalledTimes(initialCalls);
+    act(() => monitor.result.current.changePreferences({ qaTeamBindings: { javier: { accountId: "{javier}", displayName: "Javier Mejías", atlassianAccountId: "atlassian-javier" } } }));
+    expect(readRepository).toHaveBeenCalledTimes(initialCalls);
+    act(() => monitor.result.current.changePreferences({ qaTeamMembers: [{ accountId: "qa-new", displayName: "New QA" }] }));
+    expect(readRepository).toHaveBeenCalledTimes(initialCalls);
+    await act(async () => { await monitor.result.current.saveQaTeam([{ accountId: "qa-new", displayName: "New QA" }]); });
+    await waitFor(() => expect(vi.mocked(readRepository).mock.calls.at(-1)?.[4]).toEqual(["qa-new"]));
+    await act(async () => { await monitor.result.current.saveQaTeam([]); });
+    await waitFor(() => expect(vi.mocked(readRepository).mock.calls.at(-1)?.[4]).toEqual([]));
+  });
+  it("keeps first-success notification baselines across a partially failed cached sync", async () => {
+    const read = async (_client: unknown, repo: { slug: string }) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${pr.repository.workspace}/${pr.repository.slug}#${pr.id}` }));
+    vi.mocked(readRepository).mockImplementation(async (client, repo) => { if (repo.slug === "providers_api") throw new Error("offline"); return read(client, repo); });
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    act(() => first.result.current.changePreferences({ notificationsEnabled: true, soundEnabled: true }));
+    first.unmount();
+    vi.mocked(readRepository).mockImplementation(read);
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.syncState.source).toBe("cache");
+    await act(async () => { await restored.result.current.sync(); });
+    expect(playNotificationSound).not.toHaveBeenCalled();
+    expect(showSystemNotification).not.toHaveBeenCalled();
+  });
+  it("keeps the original next-sync deadline after restoration and synchronizes automatically at ten minutes", async () => {
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${pr.repository.workspace}/${pr.repository.slug}#${pr.id}` })));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    expect(first.result.current.loading).toBe(false);
+    const calls = vi.mocked(readRepository).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5 * 60000); });
+    first.unmount();
+    const restored = renderHook(useMonitor);
+    await act(async () => {});
+    expect(restored.result.current.syncState.source).toBe("cache");
+    await act(async () => { await vi.advanceTimersByTimeAsync(5 * 60000 - 1); });
+    expect(readRepository).toHaveBeenCalledTimes(calls);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(readRepository).toHaveBeenCalledTimes(calls + 2);
+  });
+  it("restores cached PR immediately after verification without reading repositories again", async () => {
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${pr.repository.workspace}/${pr.repository.slug}#${pr.id}` })));
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    const calls = vi.mocked(readRepository).mock.calls.length;
+    first.unmount();
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.loading).toBe(false);
+    expect(restored.result.current.data).toHaveLength(5);
+    expect(restored.result.current.syncState.source).toBe("cache");
+    expect(readRepository).toHaveBeenCalledTimes(calls);
+    act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+    expect(readRepository).toHaveBeenCalledTimes(calls);
+    await act(async () => { await restored.result.current.sync(); });
+    expect(readRepository).toHaveBeenCalledTimes(calls + 2);
+  });
+
+  it("shows stale cached data while refreshing once its original ten-minute deadline passes", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).map((pr) => ({ ...pr, key: `${pr.repository.workspace}/${pr.repository.slug}#${pr.id}` })));
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    const calls = vi.mocked(readRepository).mock.calls.length;
+    first.unmount();
+    clock.mockReturnValue(Date.now() + syncIntervalMs);
+    vi.mocked(readRepository).mockReturnValue(new Promise(() => {}));
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.data).toHaveLength(5);
+    expect(restored.result.current.loading).toBe(false);
+    expect(restored.result.current.syncState.status).toBe("syncing");
+    expect(readRepository).toHaveBeenCalledTimes(calls + 2);
+  });
+
+  it("discards a forbidden repository instead of retaining its private cached PR", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    vi.mocked(readRepository).mockRejectedValue(new BitbucketApiError(403, "Forbidden", "forbidden"));
+    await act(async () => { await result.current.sync(); });
+    expect(result.current.data).toEqual([]);
+    expect(result.current.syncState.status).toBe("error");
+  });
+  it("keeps anonymous data empty and refuses sync or preference writes without a session", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.requiresLogin).toBe(true);
+    expect(result.current.user).toBeUndefined();
+    expect(result.current.data).toEqual([]);
+    await act(async () => { await result.current.sync(); result.current.changePreferences({ role: "observer", ignoredPullRequestKeys: ["private#42"] }); });
+    expect(result.current.preferences).toEqual({ ...defaultPreferences, qaTeamMembers: [], qaTeamBindings: {} });
+    expect(getCurrentUser).not.toHaveBeenCalled();
+    expect(readRepository).not.toHaveBeenCalled();
+  });
+
+  it("requires a selected perspective and retains it across session restoration", async () => {
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "observer"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    expect(first.result.current.preferences.role).toBe("observer");
+    first.unmount();
+    const restored = renderHook(useMonitor);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    expect(restored.result.current.preferences.role).toBe("observer");
+  });
+  it("keeps one PR identity after repeated syncs even when a reader returns duplicates", async () => {
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => demoDataset.pullRequests.filter((pr) => pr.repository.slug === repo.slug).flatMap((pr) => [pr, pr]));
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.data).toHaveLength(5);
+    await act(async () => { await result.current.sync(); await result.current.sync(); });
+    expect(result.current.data).toHaveLength(5);
+    expect(new Set(result.current.data.map((pr) => pr.key)).size).toBe(5);
+  });
+  it("restores the verified account after reload and keeps its original deadline", async () => {
+    const first = renderHook(useMonitor);
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    await act(async () => { await first.result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    const saved = readSession();
+    first.unmount();
+    const restored = renderHook(useMonitor);
+    expect(restored.result.current.loading).toBe(true);
+    expect(restored.result.current.data).toEqual([]);
+    await waitFor(() => expect(restored.result.current.connected).toBe(true));
+    await waitFor(() => expect(restored.result.current.loading).toBe(false));
+    expect(restored.result.current.user?.accountId).toBe("test-live");
+    expect(restored.result.current.data).toHaveLength(5);
+    expect(readSession()).toEqual(saved);
+    expect(getCurrentUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps loading active until the first repository sync completes", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    let finish = () => {};
+    const pendingRepositories = new Promise<typeof demoDataset.pullRequests>((resolve) => { finish = () => resolve([]); });
+    vi.mocked(readRepository).mockReturnValue(pendingRepositories);
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    expect(result.current.loading).toBe(true);
+    expect(result.current.data).toEqual([]);
+    await act(async () => { finish(); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+  });
+
+  it("expires after 12 hours on focus and discards in-flight results", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-23T02:59:59Z"));
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    let finish = () => {};
+    vi.mocked(readRepository).mockImplementation(() => new Promise((resolve) => { const previous = finish; finish = () => { previous(); resolve(demoDataset.pullRequests); }; }));
+    let pending: Promise<void>;
+    act(() => { pending = result.current.sync(); });
+    now.mockReturnValue(sessionExpiresAt(Date.parse("2026-10-23T02:59:59Z")));
+    act(() => { window.dispatchEvent(new Event("focus")); });
+    await act(async () => { finish(); await pending; });
+    expect(result.current.connected).toBe(false);
+    expect(result.current.requiresLogin).toBe(true);
+    expect(result.current.data).toEqual([]);
+    expect(result.current.sessionNotice).toContain("12 horas");
+    expect(window.localStorage.getItem(sessionStorageKey)).toBeNull();
+    await act(async () => { await result.current.sync(); });
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("never restores an already expired credential or substitutes demo data", async () => {
+    const createdAt = Date.parse("2026-10-21T22:00:00Z");
+    saveSession({ version: 2, email: "test@example.com", token: "test-token", createdAt, expiresAt: sessionExpiresAt(createdAt) });
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-22T12:00:00Z"));
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.requiresLogin).toBe(true));
+    expect(result.current.loading).toBe(false);
+    expect(result.current.data).toEqual([]);
+    expect(getCurrentUser).not.toHaveBeenCalled();
+  });
+
+  it("stays connected past midnight and closes automatically after 12 hours", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(new Date("2026-10-23T02:59:59Z"));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    expect(result.current.connected).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(result.current.connected).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(12 * 60 * 60 * 1000 - 1001); });
+    expect(result.current.connected).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.connected).toBe(false);
+    expect(result.current.requiresLogin).toBe(true);
+    expect(readSession().status).toBe("none");
+  });
+
+  it("keeps a saved session on a transient verification failure, but rejects revoked tokens", async () => {
+    const createdAt = Date.now();
+    saveSession({ version: 2, email: "test@example.com", token: "test-token", createdAt, expiresAt: sessionExpiresAt(createdAt) });
+    vi.mocked(getCurrentUser).mockRejectedValueOnce(new BitbucketApiError(undefined, "offline", "network"));
+    const offline = renderHook(useMonitor);
+    await waitFor(() => expect(offline.result.current.requiresLogin).toBe(true));
+    expect(readSession().status).toBe("saved");
+    expect(offline.result.current.data).toEqual([]);
+    offline.unmount();
+    vi.mocked(getCurrentUser).mockRejectedValueOnce(new BitbucketApiError(401, "revoked", "unauthorized"));
+    const revoked = renderHook(useMonitor);
+    await waitFor(() => expect(revoked.result.current.requiresLogin).toBe(true));
+    expect(readSession().status).toBe("none");
+  });
+
+  it("removes the persisted session when disconnecting", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.disconnect());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.connected).toBe(false);
+    expect(readSession().status).toBe("none");
+    expect(result.current.requiresLogin).toBe(true);
+    expect(result.current.data).toEqual([]);
+    expect(result.current.user).toBeUndefined();
+    await act(async () => { await result.current.sync(); });
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("baselines old events, groups new comments into one PR notice and does not repeat it", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.data).toHaveLength(5));
+    expect(playNotificationSound).not.toHaveBeenCalled();
+    act(() => result.current.changePreferences({ notificationsEnabled: true, soundEnabled: true }));
+    const changed = { ...demoDataset.pullRequests[0], comments: [...demoDataset.pullRequests[0].comments, ...[900, 901].map((id) => ({ id, createdAt: "2026-10-22T22:00:00Z", content: "Another review section", author: demoDataset.currentUser, inline: false, link: "#" }))] };
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => repo.slug === changed.repository.slug ? [changed] : []);
+    await act(async () => { await result.current.sync(); });
+    expect(playNotificationSound).toHaveBeenCalledTimes(1);
+    expect(showSystemNotification).toHaveBeenCalledWith(1);
+    expect(notificationEventIds(changed).filter((id) => !result.current.preferences.lastObservedEventIds.includes(id))).toHaveLength(2);
+    await act(async () => { await result.current.sync(); });
+    expect(playNotificationSound).toHaveBeenCalledTimes(1);
+    expect(showSystemNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a failed repository while refreshing the other", async () => {
+    const { result } = renderHook(useMonitor);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.connect("test@example.com", "test-token", "qa"); });
+    await waitFor(() => expect(result.current.data).toHaveLength(5));
+    vi.mocked(readRepository).mockImplementation(async (_client, repo) => {
+      if (repo.slug === "kontroller_test") throw new Error("Forbidden");
+      return [];
+    });
+    await act(async () => { await result.current.sync(); });
+    expect(result.current.data).toHaveLength(3);
+    expect(result.current.syncState.status).toBe("error");
+    expect(result.current.syncState.message).toContain("kontroller_test/kontroller_test");
+  });
+});
