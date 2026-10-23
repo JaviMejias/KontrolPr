@@ -1,5 +1,11 @@
 # KontrolPR technical decisions
 
+## Native ESM API deployment — 2026-10-23
+
+The first real Vercel deployment failed with `ERR_MODULE_NOT_FOUND` while resolving the extensionless `../server/blob-qa-team-store` import. Vite/Vitest's bundler resolution accepted this graph, so the prior tests and frontend build did not detect the production-only failure. All relative imports in the API runtime graph now name the emitted `.js` files, without changing authentication, roster data, Blob configuration or dependencies. The local Vite adapter uses the same spelling.
+
+`tsconfig.api.json` checks the API entry point and its transitive dependencies with `NodeNext`, independently of Vite's existing bundler configuration. The root build includes this check. A regression test compiles that graph without bundling and imports the emitted entry point in a fresh Node process, with synthetic identity responses and no Blob token. It checks unauthenticated `401` and authenticated-but-unconfigured `503 not_configured`; it does not substitute for a real redeployment, valid Blob read or account acceptance test. The initial test failed with TS2835 before the imports were fixed.
+
 ## Incremental PR reads — 2026-10-23
 
 The user approved optimizing repeated PR reads without a shared credential or a new PR backend. Keep existing local IndexedDB/session boundaries, 12-hour retention, logout cleanup, ten-minute visible polling, permissions and QA/developer state semantics. Do not silently retain private repository data across new logins. No dependencies or UI changes required.

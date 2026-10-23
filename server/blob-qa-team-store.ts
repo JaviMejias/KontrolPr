@@ -1,8 +1,8 @@
 import { BlobError, BlobPreconditionFailedError, get, put } from "@vercel/blob";
-import { sharedQaTeamSchema } from "../src/lib/team/contracts";
-import { conflict, maxQaTeamBytes, QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http";
-import { storedQaTeamSchema } from "./qa-team-store";
-import type { QaTeamStore } from "./qa-team-store";
+import { sharedQaTeamSchema } from "../src/lib/team/contracts.js";
+import { conflict, maxQaTeamBytes, QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http.js";
+import { storedQaTeamSchema } from "./qa-team-store.js";
+import type { QaTeamStore } from "./qa-team-store.js";
 
 export const qaTeamBlobPathname = "kontrolpr/shared-qa-team-v1.json";
 

@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { z } from "zod";
-import { QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http";
+import { QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http.js";
 
 const identitySchema = z.object({ uuid: z.string().regex(/^\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}$/i).transform((value) => value.toLowerCase()) });
 const unauthorized = () => new QaTeamError(401, "unauthorized", "Inicia sesión con una cuenta válida de Bitbucket.");

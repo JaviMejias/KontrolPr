@@ -1,5 +1,5 @@
-import { createBlobQaTeamStore } from "../server/blob-qa-team-store";
-import { createQaTeamHandler } from "../server/qa-team";
+import { createBlobQaTeamStore } from "../server/blob-qa-team-store.js";
+import { createQaTeamHandler } from "../server/qa-team.js";
 
 export const handler = createQaTeamHandler({ store: createBlobQaTeamStore() });
 

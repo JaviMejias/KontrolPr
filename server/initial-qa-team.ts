@@ -1,4 +1,4 @@
-import { qaTeamMembersSchema } from "../src/lib/team/contracts";
+import { qaTeamMembersSchema } from "../src/lib/team/contracts.js";
 
 export const soleQaEditorId = "{04fdd9ab-e88f-4f82-a6d0-381c527c470a}";
 export const initialQaTeam = qaTeamMembersSchema.parse([

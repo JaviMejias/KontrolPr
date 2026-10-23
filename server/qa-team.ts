@@ -1,10 +1,10 @@
 import { z } from "zod";
-import { qaTeamMembersSchema, sharedQaTeamSchema } from "../src/lib/team/contracts";
-import { initialQaTeam, soleQaEditorId } from "./initial-qa-team";
-import { authenticateBitbucket } from "./bitbucket-auth";
-import { conflict, invalidRequest, jsonResponse, maxQaTeamBytes, QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http";
-import { storedQaTeamSchema } from "./qa-team-store";
-import type { QaTeamStore } from "./qa-team-store";
+import { qaTeamMembersSchema, sharedQaTeamSchema } from "../src/lib/team/contracts.js";
+import { initialQaTeam, soleQaEditorId } from "./initial-qa-team.js";
+import { authenticateBitbucket } from "./bitbucket-auth.js";
+import { conflict, invalidRequest, jsonResponse, maxQaTeamBytes, QaTeamError, readJsonLimited, unavailable, withDeadline } from "./http.js";
+import { storedQaTeamSchema } from "./qa-team-store.js";
+import type { QaTeamStore } from "./qa-team-store.js";
 
 export interface QaTeamHandlerOptions {
   store: QaTeamStore;

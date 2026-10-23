@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { qaTeamMembersSchema } from "../src/lib/team/contracts";
-import { soleQaEditorId } from "./initial-qa-team";
+import { qaTeamMembersSchema } from "../src/lib/team/contracts.js";
+import { soleQaEditorId } from "./initial-qa-team.js";
 
 export const storedQaTeamSchema = z.strictObject({
   version: z.literal(1),

@@ -1,8 +1,8 @@
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
-import { createBlobQaTeamStore } from "./blob-qa-team-store";
-import { createQaTeamHandler } from "./qa-team";
+import { createBlobQaTeamStore } from "./blob-qa-team-store.js";
+import { createQaTeamHandler } from "./qa-team.js";
 
 export function qaTeamMiddleware(handler: (request: Request) => Promise<Response>) {
   return (incoming: IncomingMessage, outgoing: ServerResponse, next: () => void) => {
